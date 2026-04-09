@@ -13,21 +13,47 @@ static ULONG   g_DseCount = 0;
 static PULONG  g_DseAddrs[DSE_MAX_ADDRS] = {0};
 static ULONG   g_DseOrig[DSE_MAX_ADDRS] = {0};
 
+static NTSTATUS DseWriteOne(PULONG target, ULONG val)
+{
+	PMDL mdl;
+	PULONG mapped;
+
+	mdl = IoAllocateMdl(target, sizeof(ULONG), FALSE, FALSE, NULL);
+	if (!mdl) return STATUS_INSUFFICIENT_RESOURCES;
+
+	__try
+	{
+		MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		IoFreeMdl(mdl);
+		return STATUS_ACCESS_VIOLATION;
+	}
+
+	mapped = (PULONG)MmMapLockedPagesSpecifyCache(
+		mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+
+	if (mapped)
+	{
+		MmProtectMdlSystemAddress(mdl, PAGE_READWRITE);
+		*mapped = val;
+		MmUnmapLockedPages(mapped, mdl);
+	}
+
+	MmUnlockPages(mdl);
+	IoFreeMdl(mdl);
+	return mapped ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static void DseWriteAll(ULONG val)
 {
-	KIRQL irql;
-	ULONG64 cr0;
 	ULONG i;
-	KeRaiseIrql(DISPATCH_LEVEL, &irql);
-	cr0 = __readcr0();
-	__writecr0(cr0 & ~(1ULL << 16));
 	for (i = 0; i < g_DseCount; i++)
 	{
 		if (g_DseAddrs[i] && MmIsAddressValid(g_DseAddrs[i]))
-			*g_DseAddrs[i] = val;
+			DseWriteOne(g_DseAddrs[i], val);
 	}
-	__writecr0(cr0);
-	KeLowerIrql(irql);
 }
 
 NTSTATUS CopyVirtualMemory(PEPROCESS targetProcess, PVOID sourceAddress, PVOID targetAddress, SIZE_T size)
@@ -268,15 +294,10 @@ NTSTATUS IoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	{
 		if (g_DseCount > 0)
 		{
-			KIRQL irql; ULONG64 cr0; ULONG i;
-			KeRaiseIrql(DISPATCH_LEVEL, &irql);
-			cr0 = __readcr0();
-			__writecr0(cr0 & ~(1ULL << 16));
+			ULONG i;
 			for (i = 0; i < g_DseCount; i++)
 				if (g_DseAddrs[i] && MmIsAddressValid(g_DseAddrs[i]))
-					*g_DseAddrs[i] = g_DseOrig[i];
-			__writecr0(cr0);
-			KeLowerIrql(irql);
+					DseWriteOne(g_DseAddrs[i], g_DseOrig[i]);
 			status = STATUS_SUCCESS;
 		}
 		else status = STATUS_DEVICE_NOT_READY;
